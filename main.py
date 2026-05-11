@@ -26,6 +26,13 @@ SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
 
 app = FastAPI(title="Backend Hermes Seguros")
 
+# monitor uptime
+
+@app.get("/")
+@app.head("/")
+def health_check():
+    return {"status": "ok", "mensaje": "El backend de Hermes está despierto."}
+
 # 2. Configuración de CORS
 # Esto permite que tu frontend en el puerto 5173 pueda hablar con este servidor
 app.add_middleware(
