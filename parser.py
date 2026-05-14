@@ -25,57 +25,55 @@ def extraer_datos_vehiculo(texto):
 
     t = texto.replace('\n', ' ').strip()
     
-    # 1. Definimos los 4 formatos EXACTOS de Argentina
     patrones = [
-        r'\b([A-Z]{2}\s?\d{3}\s?[A-Z]{2})\b', # Auto Mercosur (ej: AB 123 CD)
-        r'\b([A-Z]{1}\s?\d{3}\s?[A-Z]{3})\b', # Moto Mercosur (ej: A 123 BCD) - ESTA ES TU CORVEN
-        r'\b([A-Z]{3}\s?\d{3})\b',            # Auto Clásica (ej: ABC 123)
-        r'\b(\d{3}\s?[A-Z]{3})\b'             # Moto Clásica (ej: 123 ABC)
+        r'\b([A-Z]{2}\s?\d{3}\s?[A-Z]{2})\b', # Auto Mercosur
+        r'\b([A-Z]{1}\s?\d{3}\s?[A-Z]{3})\b', # Moto Mercosur
+        r'\b([A-Z]{3}\s?\d{3})\b',            # Auto Clásica
+        r'\b(\d{3}\s?[A-Z]{3})\b'             # Moto Clásica
     ]
     
     patente = None
     
-    # 2. Buscamos coincidencias estrictas
     for patron in patrones:
-        # finditer nos da todas las coincidencias en el texto
         matches = list(re.finditer(patron, t, re.IGNORECASE))
         if matches:
-            # Tomamos SIEMPRE la última coincidencia (evita falsos positivos en el medio)
             ultimo_match = matches[-1]
             patente = ultimo_match.group(1).replace(' ', '').upper()
-            
-            # Borramos SOLO esa patente del texto original
             t = t[:ultimo_match.start()] + t[ultimo_match.end():]
             break
 
-    # 3. Limpieza profunda del modelo
-    # Repetimos el sub para limpiar combinaciones como "MOTOVEHICULO PARTICULAR"
-    #for _ in range(2): 
-     #   t = re.sub(r'^(AUTOMOVIL|MOTOVEHICULO|PARTICULAR|PICK-UP|MOTO|TRANSPORTE|COMERCIAL|/)\s*', '', t, flags=re.IGNORECASE)
-    
-    # Limpiamos basura que haya quedado al final (guiones, puntos, espacios)
     modelo = re.sub(r'[-\s/.]+$', '', t).strip()
 
     return modelo if modelo else "Ver Póliza", patente
-    return modelo if modelo else "Ver Póliza", patente
 
-def procesar_archivo_seguros(ruta):
+
+# --- FUNCIÓN PRINCIPAL ---
+# ¡Ahora requiere que le pases la compañía que viene del Frontend!
+def procesar_archivo_seguros(ruta, compania_seleccionada):
     if not os.path.exists(ruta):
         raise FileNotFoundError(f"Archivo no encontrado: {ruta}")
 
     ext = os.path.splitext(ruta)[1].lower()
     encoding = 'latin-1'
     
+    # 1. Normalizamos el texto (ej: "Antártida Seguros" -> "ANTARTIDA")
+    compania_limpia = str(compania_seleccionada).upper().replace('Á', 'A').replace(' SEGUROS', '').strip()
+
     try:
-        if ext == '.csv':
-            # --- ANTARTIDA ---
-            df = pd.read_csv(ruta, sep=';', encoding=encoding, skiprows=1, on_bad_lines='skip')
-            df_final = []
+        df_final = []
+
+        # 2. Leemos la estructura correcta según lo que se seleccionó
+        if compania_limpia == 'ANTARTIDA':
+            # --- LÓGICA ANTÁRTIDA ---
+            if ext == '.csv':
+                df = pd.read_csv(ruta, sep=';', encoding=encoding, skiprows=1, on_bad_lines='skip')
+            else:
+                df = pd.read_excel(ruta, engine='xlrd' if ext == '.xls' else None, skiprows=1)
             
             for _, row in df.iterrows():
                 poliza_num = str(row.iloc[1]).strip()
                 df_final.append({
-                    'compania_nombre': 'ANTARTIDA',
+                    'compania_nombre': 'ANTARTIDA', 
                     'dni': poliza_num, 
                     'nombre_completo': str(row.iloc[4]).strip(),
                     'telefono': None,
@@ -90,10 +88,12 @@ def procesar_archivo_seguros(ruta):
                     'detalles_bien': {'rama': str(row.iloc[0])}
                 })
             
-        elif ext in ['.xls', '.xlsx']:
-            # --- RUS ---
-            df = pd.read_excel(ruta, engine='xlrd' if ext == '.xls' else None, skiprows=5)
-            df_final = []
+        elif compania_limpia == 'RUS':
+            # --- LÓGICA RUS ---
+            if ext == '.csv':
+                df = pd.read_csv(ruta, sep=';', encoding=encoding, skiprows=5, on_bad_lines='skip')
+            else:
+                df = pd.read_excel(ruta, engine='xlrd' if ext == '.xls' else None, skiprows=5)
             
             for _, row in df.iterrows():
                 pol_aseg = str(row.iloc[1]).split('\n')
@@ -123,10 +123,12 @@ def procesar_archivo_seguros(ruta):
                     'saldo_adeudado': clean_amount(row.iloc[10]),
                     'estado_vigencia': 'VIGENTE',
                     'tipo': tipo_seguro, 
-                    'descripcion_modelo': modelo_limpio,  # <--- Ahora va limpio
-                    'patente': patente_encontrada,        # <--- Ahora sí tiene la patente posta
+                    'descripcion_modelo': modelo_limpio,
+                    'patente': patente_encontrada,
                     'detalles_bien': {'cobertura_original': str(row.iloc[8])}
                 })
+        else:
+            print(f"No hay lógica de lectura (parser) implementada para la compañía: {compania_limpia}")
 
         return pd.DataFrame(df_final)
 

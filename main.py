@@ -1,17 +1,20 @@
-from fastapi import FastAPI, HTTPException, Depends, Security
+from fastapi import FastAPI, HTTPException, Depends, Security, File, UploadFile
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 import os
 from dotenv import load_dotenv
 from sqlalchemy import create_engine, func
-from sqlalchemy.orm import sessionmaker, joinedload
-from datetime import date, timedelta
+from sqlalchemy.orm import sessionmaker, joinedload, Session
+from datetime import date, timedelta, datetime
 from inteligencia import generar_mensaje_renovacion
 from notificaciones import enviar_alerta_push
 import json
 from pywebpush import webpush, WebPushException
 from auth import crear_token_acceso, verificar_token
+import PyPDF2
+from io import BytesIO
+from google import genai
 
 # Importamos tus modelos (asegúrate de que el archivo se llame models.py)
 from models import Cliente, Poliza, Compania, BienAsegurado, UsuarioAdmin, SuscripcionPush
@@ -414,4 +417,136 @@ def disparar_alerta_inteligente(id_poliza: str, usuario: dict = Depends(obtener_
         return {"success": enviado, "mensaje_generado": mensaje_magico}
     finally:
         db.close()
+        
+        
+@app.post("/api/upload-poliza")
+async def upload_poliza(file: UploadFile = File(...)):
+    # 1. Verificar que sea un PDF
+    if not file.filename.endswith('.pdf'):
+        raise HTTPException(status_code=400, detail="El archivo debe ser un PDF")
+
+    try:
+        # 2. Leer el archivo PDF en memoria
+        contenido_pdf = await file.read()
+        lector = PyPDF2.PdfReader(BytesIO(contenido_pdf))
+        
+        texto_extraido = ""
+        # Extraemos el texto de las primeras páginas
+        for i in range(min(5, len(lector.pages))):
+            texto_extraido += lector.pages[i].extract_text()
+
+        # 3. Inicializar el cliente de Gemini usando la llave específica de Franci
+        clave_ia = os.getenv("GEMINI_API_KEY_PDF")
+        if not clave_ia:
+            raise HTTPException(status_code=500, detail="Falta la API Key en el archivo .env")
+            
+        client = genai.Client(api_key=clave_ia)
+        
+        prompt = f"""
+        Eres un asistente experto en seguros de Argentina. Analiza el siguiente texto extraído de una póliza de seguros y extrae EXCLUSIVAMENTE los siguientes datos.
+        
+        Devuelve el resultado ÚNICAMENTE en un formato JSON válido, sin usar markdown ni comillas invertidas, con esta estructura exacta:
+        {{
+            "nombre": "Nombre completo del asegurado",
+            "dni": "Número de DNI exacto (suele tener 8 dígitos). NO pongas el CUIT completo. Si el texto tiene DNI y CUIT, elige el DNI. Si SOLO hay CUIT de 11 dígitos, extrae únicamente los 8 números centrales (ese es el DNI).",
+            "poliza": "Número de la póliza",
+            "tipo_seguro": "Categoriza el seguro leyendo el texto (ej: Automotor, Vida, Accidentes Personales, Sepelio, Integrales de Comercio, ART, etc.)",
+            "patente": "Patente del vehículo (solo si es Automotor, de lo contrario déjalo vacío)",
+            "vehiculo": "Marca y modelo (solo si es Automotor, de lo contrario déjalo vacío)",
+            "vigencia_desde": "Fecha en formato DD/MM/AAAA",
+            "vigencia_hasta": "Fecha en formato DD/MM/AAAA"
+        }}
+        
+        Texto de la póliza:
+        {texto_extraido}
+        """
+
+        # 4. Llamar a la última versión del modelo usando la sintaxis nueva
+        response = client.models.generate_content(
+            model='gemini-flash-latest',
+            contents=prompt
+        )
+        
+        # 5. Limpiar la respuesta y convertir a diccionario
+        texto_json = response.text.strip()
+        if texto_json.startswith("```json"):
+            texto_json = texto_json[7:-3] 
+        elif texto_json.startswith("```"):
+            texto_json = texto_json[3:-3]
+            
+        datos_poliza = json.loads(texto_json)
+        
+        return {"mensaje": "Póliza procesada con éxito", "datos": datos_poliza}
+
+    except json.JSONDecodeError:
+        raise HTTPException(status_code=500, detail="La IA no devolvió un JSON válido.")
+    except Exception as e:
+        print(f"🚨 ERROR CRÍTICO EN IA: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"La IA falló: {str(e)}")
+
+@app.post("/api/save-poliza")
+async def save_poliza(datos: dict):
+    db = SessionLocal()
+    try:
+        # 1. Convertimos las fechas
+        fecha_desde = datetime.strptime(datos['vigencia_desde'], "%d/%m/%Y").date()
+        fecha_hasta = datetime.strptime(datos['vigencia_hasta'], "%d/%m/%Y").date()
+
+        # 2. Upsert del Cliente
+        cliente = db.query(Cliente).filter(Cliente.dni == datos['dni']).first()
+        if not cliente:
+            cliente = Cliente(
+                nombre_completo=datos['nombre'],
+                dni=datos['dni'],
+                telefono="", 
+                is_active=True
+            )
+            db.add(cliente)
+            db.flush() # Guardamos temporalmente para tener el cliente.id
+
+        # 3. Upsert de la Compañía (Busca por nombre, si no existe la crea)
+        compania_id = None
+        if datos.get('compania'):
+            cia = db.query(Compania).filter(Compania.nombre == datos['compania']).first()
+            if not cia:
+                cia = Compania(nombre=datos['compania'], is_active=True)
+                db.add(cia)
+                db.flush()
+            compania_id = cia.id
+
+        # 4. Guardar la Póliza usando TUS nombres de columnas
+        nueva_poliza = Poliza(
+            cliente_id=cliente.id,
+            compania_id=compania_id,
+            numero_poliza=datos['poliza'],
+            fecha_inicio=fecha_desde,          # <--- Ajustado a tu BD
+            fecha_fin_vigencia=fecha_hasta,    # <--- Ajustado a tu BD
+            estado_vigencia="VIGENTE",
+            saldo_adeudado=0,
+            is_enabled=True
+        )
+        db.add(nueva_poliza)
+        db.flush() # Guardamos para tener el nueva_poliza.id
+
+        # 5. Crear el Bien Asegurado
+        nuevo_bien = BienAsegurado(
+            poliza_id=nueva_poliza.id,
+            tipo=datos.get('tipo_seguro', 'Automotor'),
+            descripcion_modelo=datos.get('vehiculo', ''),
+            patente=datos.get('patente', ''),
+            detalles={}
+        )
+        db.add(nuevo_bien)
+
+        # 6. Confirmar todo el paquete junto
+        db.commit()
+        
+        return {"status": "success", "message": "Póliza y Bien Asegurado vinculados correctamente"}
+    except Exception as e:
+        db.rollback()
+        print(f"🚨 Error en save-poliza: {str(e)}") 
+        raise HTTPException(status_code=500, detail=str(e))
+    finally:
+        db.close()
+
 # Para ejecutar: uvicorn main:app --reload
