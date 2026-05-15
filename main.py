@@ -24,7 +24,12 @@ load_dotenv()
 DATABASE_URL = os.getenv("DATABASE_URL")
 
 # Neon requiere sslmode=require para conexiones seguras
-engine = create_engine(DATABASE_URL, connect_args={"sslmode": "require"})
+engine = create_engine(
+    DATABASE_URL, 
+    connect_args={"sslmode": "require"},
+    pool_pre_ping=True,   # <--- Verifica si la conexión sigue viva antes de usarla
+    pool_recycle=1800     # <--- Cierra y renueva las conexiones cada 30 minutos
+)
 SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
 
 app = FastAPI(title="Backend Hermes Seguros")
