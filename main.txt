@@ -447,23 +447,14 @@ async def upload_poliza(file: UploadFile = File(...)):
             
         client = genai.Client(api_key=clave_ia)
         
-        # PROMPT MEJORADO: Ahora Gemini detecta la compañía basándose en firmas, textos
         prompt = f"""
-        Eres un asistente experto en seguros de Argentina.
-        Analiza el siguiente texto extraído de una póliza de seguros y extrae EXCLUSIVAMENTE los siguientes datos.
+        Eres un asistente experto en seguros de Argentina. Analiza el siguiente texto extraído de una póliza de seguros y extrae EXCLUSIVAMENTE los siguientes datos.
         
-        REGLA CRÍTICA PARA COMPAÑÍA:
-        Identifica a qué compañía aseguradora pertenece el documento buscando nombres, logos en texto o firmas:
-        - Si el texto menciona "Río Uruguay", "RUS", "Uruguay Seguros", el campo "compania" DEBE ser estrictamente: "RUS"
-        - Si el texto menciona "Antártida", "Antártida Seguros", el campo "compania" DEBE ser estrictamente: "ANTARTIDA"
-        - Si pertenece a otra compañía, escribe su nombre estándar en mayúsculas.
-
         Devuelve el resultado ÚNICAMENTE en un formato JSON válido, sin usar markdown ni comillas invertidas, con esta estructura exacta:
         {{
             "nombre": "Nombre completo del asegurado",
             "dni": "Número de DNI exacto (suele tener 8 dígitos). NO pongas el CUIT completo. Si el texto tiene DNI y CUIT, elige el DNI. Si SOLO hay CUIT de 11 dígitos, extrae únicamente los 8 números centrales (ese es el DNI).",
             "poliza": "Número de la póliza",
-            "compania": "RUS o ANTARTIDA",
             "tipo_seguro": "Categoriza el seguro leyendo el texto (ej: Automotor, Vida, Accidentes Personales, Sepelio, Integrales de Comercio, ART, etc.)",
             "patente": "Patente del vehículo (solo si es Automotor, de lo contrario déjalo vacío)",
             "vehiculo": "Marca y modelo (solo si es Automotor, de lo contrario déjalo vacío)",
