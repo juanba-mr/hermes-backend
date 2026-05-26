@@ -15,6 +15,7 @@ from auth import crear_token_acceso, verificar_token
 import PyPDF2
 from io import BytesIO
 from google import genai
+from supabase import create_client, Client
 
 # Importamos tus modelos (asegúrate de que el archivo se llame models.py)
 from models import Cliente, Poliza, Compania, BienAsegurado, UsuarioAdmin, SuscripcionPush
@@ -31,6 +32,11 @@ engine = create_engine(
     pool_recycle=1800     # <--- Cierra y renueva las conexiones cada 30 minutos
 )
 SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
+
+# Inicialización del cliente de Supabase Storage
+SUPABASE_URL = os.getenv("SUPABASE_URL")
+SUPABASE_KEY = os.getenv("SUPABASE_KEY")
+supabase_client: Client = create_client(SUPABASE_URL, SUPABASE_KEY) if SUPABASE_URL else None
 
 app = FastAPI(title="Backend Hermes Seguros")
 
@@ -52,6 +58,11 @@ app.add_middleware(
 )
 # Esto le dice a FastAPI que busque el "Candadito" en la documentación (Swagger)
 security = HTTPBearer()
+
+# Inicialización del cliente de Supabase Storage
+SUPABASE_URL = os.getenv("SUPABASE_URL")
+SUPABASE_KEY = os.getenv("SUPABASE_KEY")
+supabase_client: Client = create_client(SUPABASE_URL, SUPABASE_KEY) if SUPABASE_URL else None
 
 def obtener_usuario_actual(res: HTTPAuthorizationCredentials = Security(security)):
     """
@@ -165,7 +176,8 @@ def get_perfil_cliente(dni: str, usuario: dict = Depends(obtener_usuario_actual)
                     "estado": p.estado_vigencia.lower(), # 'vigente' o 'vencida'
                     # Si el saldo es 0 o negativo, está al día
                     "estado_pago": "al_dia" if (p.saldo_adeudado or 0) <= 0 else "vencido",
-                    "asistencia_telefono": cia.telefono_asistencia if cia else "0800-XXX-XXXX"
+                    "asistencia_telefono": cia.telefono_asistencia if cia else "0800-XXX-XXXX",
+                    "pdf_url": p.pdf_url
                 })
 
         return {
@@ -208,7 +220,8 @@ def get_detalle_poliza(dni: str, numero_poliza: str, usuario: dict = Depends(obt
                 "patente": bien.patente if bien else "S/D",
                 "detalles": bien.detalles if bien else {}
             },
-            "cobertura": poliza.datos_especificos.get('cobertura_completa', "Consultar con productor")
+            "cobertura": poliza.datos_especificos.get('cobertura_completa', "Consultar con productor"), 
+            "pdf_url": poliza.pdf_url
         }
     finally:
         db.close()
@@ -254,18 +267,28 @@ def get_admin_clientes(usuario: dict = Depends(obtener_usuario_actual)):
     
     db = SessionLocal()
     try:
-        clientes = db.query(Cliente).all()
+        # Usamos joinedload para que traiga las pólizas y compañías súper rápido
+        clientes = db.query(Cliente).options(joinedload(Cliente.polizas).joinedload(Poliza.compania)).all()
         result = []
         for c in clientes:
-            # Calculamos cuántas pólizas tiene cada uno
-            cant_polizas = len([p for p in c.polizas if p.is_enabled])
+            polizas_activas = [p for p in c.polizas if p.is_enabled]
+            cant_polizas = len(polizas_activas)
+            
+            # Recolectamos datos únicos de este cliente para los filtros
+            companias = list(set([p.compania.nombre for p in polizas_activas if p.compania]))
+            formas_pago = list(set([p.forma_pago for p in polizas_activas if getattr(p, 'forma_pago', None) and p.forma_pago != 'S/D']))
+            estados = list(set([p.estado_vigencia for p in polizas_activas if p.estado_vigencia]))
+            
             result.append({
                 "id": str(c.id),
                 "dni": c.dni,
                 "nombre": c.nombre_completo,
                 "telefono": c.telefono or "Sin teléfono",
                 "cant_polizas": cant_polizas,
-                "estado": "Activo" if c.is_active else "Inactivo"
+                "estado": "Activo" if c.is_active else "Inactivo",
+                "companias": companias,
+                "formas_pago": formas_pago,
+                "estados_polizas": estados
             })
         return result
     finally:
@@ -426,62 +449,78 @@ def disparar_alerta_inteligente(id_poliza: str, usuario: dict = Depends(obtener_
         
 @app.post("/api/upload-poliza")
 async def upload_poliza(file: UploadFile = File(...)):
-    # 1. Verificar que sea un PDF
     if not file.filename.endswith('.pdf'):
         raise HTTPException(status_code=400, detail="El archivo debe ser un PDF")
 
     try:
-        # 2. Leer el archivo PDF en memoria
+        # 1. Leer el archivo PDF en memoria
         contenido_pdf = await file.read()
         lector = PyPDF2.PdfReader(BytesIO(contenido_pdf))
         
         texto_extraido = ""
-        # Extraemos el texto de las primeras páginas
         for i in range(min(5, len(lector.pages))):
             texto_extraido += lector.pages[i].extract_text()
 
-        # 3. Inicializar el cliente de Gemini usando la llave específica de Franci
         clave_ia = os.getenv("GEMINI_API_KEY_PDF")
         if not clave_ia:
             raise HTTPException(status_code=500, detail="Falta la API Key en el archivo .env")
             
         client = genai.Client(api_key=clave_ia)
         
-        # PROMPT MEJORADO: Ahora Gemini detecta la compañía basándose en firmas, textos
+        # PROMPT (Tu versión mejorada)
         prompt = f"""
-        Eres un asistente experto en seguros de Argentina.
-        Analiza el siguiente texto extraído de una póliza de seguros y extrae EXCLUSIVAMENTE los siguientes datos.
-        
-        REGLA CRÍTICA PARA COMPAÑÍA:
-        Identifica a qué compañía aseguradora pertenece el documento buscando nombres, logos en texto o firmas:
-        - Si el texto menciona "Río Uruguay", "RUS", "Uruguay Seguros", el campo "compania" DEBE ser estrictamente: "RUS"
-        - Si el texto menciona "Antártida", "Antártida Seguros", el campo "compania" DEBE ser estrictamente: "ANTARTIDA"
-        - Si pertenece a otra compañía, escribe su nombre estándar en mayúsculas.
+        Eres un asistente experto y analítico en seguros de Argentina.
+        Tu tarea es leer la póliza adjunta, deducir la información oculta siguiendo ESTRICTAMENTE las reglas de negocio, y devolver los datos en formato JSON.
 
-        Devuelve el resultado ÚNICAMENTE en un formato JSON válido, sin usar markdown ni comillas invertidas, con esta estructura exacta:
+        REGLAS DE COMPAÑÍA:
+        - Si menciona "Río Uruguay", "RUS" o su CUIT, compania es "RUS".
+        - Si menciona "Antártida" o su CUIT, compania es "ANTARTIDA".
+
+        REGLAS DE FORMA DE PAGO:
+        - Si el texto dice "PAGO MANUAL", "Ventanilla", "Rapipago", "Pago Fácil" o menciona pago en efectivo/billetera virtual, forma_pago es "Efectivo".
+        - Si el texto dice "Débito Automático", "CBU", "Tarjeta", "Visa", "Mastercard", etc., forma_pago es "Tarjeta de Crédito / Débito".
+
+        REGLAS AVANZADAS PARA EL PERÍODO DE FACTURACIÓN:
+        Debes cruzar la información del tipo de vehículo, la compañía y si hay cuotas para deducir el período. Analiza el cronograma de pagos y las fechas de vigencia:
+
+        1. REGLA PARA MOTOS (Cualquier compañía):
+           - Las pólizas de motos NUNCA son mes a mes. SIEMPRE son en 1 solo pago.
+           - Según la diferencia entre vigencia_desde y vigencia_hasta, periodo_facturacion DEBE ser: "Bimestral", "Cuatrimestral" o "Semestral".
+
+        2. REGLAS PARA AUTOS EN ANTÁRTIDA:
+           - Si la póliza dura 2 meses y se abona en 1 SOLO PAGO: periodo_facturacion = "Bimestral".
+           - Si la póliza dura 2 meses pero se abona "MES A MES": periodo_facturacion = "Bimestral 2".
+
+        3. REGLAS PARA AUTOS EN RUS:
+           - Si la póliza dura 2 meses y se abona en 1 SOLO PAGO: periodo_facturacion = "Bimestral".
+           - Si la póliza se abona "MES A MES" (cuotas mensuales): periodo_facturacion = "Mensual".
+
+        ESTRUCTURA EXACTA REQUERIDA:
         {{
             "nombre": "Nombre completo del asegurado",
-            "dni": "Número de DNI exacto (suele tener 8 dígitos). NO pongas el CUIT completo. Si el texto tiene DNI y CUIT, elige el DNI. Si SOLO hay CUIT de 11 dígitos, extrae únicamente los 8 números centrales (ese es el DNI).",
-            "poliza": "Número de la póliza",
+            "dni": "Número de DNI de 8 dígitos",
+            "poliza": "Número exacto de la póliza",
             "compania": "RUS o ANTARTIDA",
-            "tipo_seguro": "Categoriza el seguro leyendo el texto (ej: Automotor, Vida, Accidentes Personales, Sepelio, Integrales de Comercio, ART, etc.)",
-            "patente": "Patente del vehículo (solo si es Automotor, de lo contrario déjalo vacío)",
-            "vehiculo": "Marca y modelo (solo si es Automotor, de lo contrario déjalo vacío)",
-            "vigencia_desde": "Fecha en formato DD/MM/AAAA",
-            "vigencia_hasta": "Fecha en formato DD/MM/AAAA"
+            "tipo_seguro": "Automotor o Moto",
+            "patente": "Patente del vehículo",
+            "vehiculo": "Marca y modelo",
+            "vigencia_desde": "DD/MM/AAAA",
+            "vigencia_hasta": "DD/MM/AAAA",
+            "periodo_facturacion": "Ej: Bimestral, Bimestral 2, Mensual",
+            "forma_pago": "Efectivo o Tarjeta de Crédito / Débito"
         }}
         
-        Texto de la póliza:
+        Texto de la póliza a analizar:
         {texto_extraido}
         """
 
-        # 4. Llamar a la última versión del modelo usando la sintaxis nueva
+        # 2. Llamada a Gemini
         response = client.models.generate_content(
             model='gemini-flash-latest',
             contents=prompt
         )
         
-        # 5. Limpiar la respuesta y convertir a diccionario
+        # 3. Tu extracción vieja y confiable
         texto_json = response.text.strip()
         if texto_json.startswith("```json"):
             texto_json = texto_json[7:-3] 
@@ -490,7 +529,47 @@ async def upload_poliza(file: UploadFile = File(...)):
             
         datos_poliza = json.loads(texto_json)
         
-        return {"mensaje": "Póliza procesada con éxito", "datos": datos_poliza}
+        # =========================================================
+        # 4. SUBIDA A SUPABASE CON MANEJO DE ERRORES SEGURO
+        # =========================================================
+        datos_poliza["pdf_url"] = None 
+        
+        try:
+            import requests
+            
+            # Limpiamos el nombre para que la URL no se rompa
+            nombre_archivo = f"{datos_poliza.get('compania', 'SD')}_{datos_poliza.get('poliza', 'SD')}.pdf"
+            nombre_archivo = nombre_archivo.replace(" ", "_").replace("/", "-")
+            
+            SUPABASE_URL = os.getenv("SUPABASE_URL")
+            SUPABASE_KEY = os.getenv("SUPABASE_KEY")
+            
+            # EL FIX ESTÁ ACÁ: El path correcto de la API es /storage/v1/object/nombre_del_bucket/nombre_del_archivo
+            url_subida = f"{SUPABASE_URL}/storage/v1/object/polizas/{nombre_archivo}"
+            
+            # Cabeceras obligatorias imitando el comportamiento de la librería
+            headers = {
+                "Authorization": f"Bearer {SUPABASE_KEY}",
+                "apikey": SUPABASE_KEY,
+                "Content-Type": "application/pdf",
+                "x-upsert": "true"
+            }
+            
+            # Disparamos el PDF en formato binario directo a la nube
+            respuesta = requests.post(url_subida, headers=headers, data=contenido_pdf)
+            
+            if respuesta.status_code == 200:
+                # Si devuelve 200 OK, armamos el link público a mano
+                url_publica = f"{SUPABASE_URL}/storage/v1/object/public/polizas/{nombre_archivo}"
+                datos_poliza["pdf_url"] = url_publica
+            else:
+                # Si sigue fallando, nos dirá por qué
+                print(f"⚠️ RECHAZO REAL DE SUPABASE: Código {respuesta.status_code} - {respuesta.text}")
+                
+        except Exception as e_req:
+            print(f"⚠️ Error conectando con la API de Supabase: {str(e_req)}")
+
+        return {"mensaje": "Póliza procesada", "datos": datos_poliza}
 
     except json.JSONDecodeError:
         raise HTTPException(status_code=500, detail="La IA no devolvió un JSON válido.")
@@ -502,11 +581,9 @@ async def upload_poliza(file: UploadFile = File(...)):
 async def save_poliza(datos: dict):
     db = SessionLocal()
     try:
-        # 1. Convertimos las fechas
         fecha_desde = datetime.strptime(datos['vigencia_desde'], "%d/%m/%Y").date()
         fecha_hasta = datetime.strptime(datos['vigencia_hasta'], "%d/%m/%Y").date()
 
-        # 2. Upsert del Cliente
         cliente = db.query(Cliente).filter(Cliente.dni == datos['dni']).first()
         if not cliente:
             cliente = Cliente(
@@ -516,9 +593,8 @@ async def save_poliza(datos: dict):
                 is_active=True
             )
             db.add(cliente)
-            db.flush() # Guardamos temporalmente para tener el cliente.id
+            db.flush()
 
-        # 3. Upsert de la Compañía (Busca por nombre, si no existe la crea)
         compania_id = None
         if datos.get('compania'):
             cia = db.query(Compania).filter(Compania.nombre == datos['compania']).first()
@@ -528,21 +604,23 @@ async def save_poliza(datos: dict):
                 db.flush()
             compania_id = cia.id
 
-        # 4. Guardar la Póliza usando TUS nombres de columnas
+        # ACA AGREGAMOS LOS TRES CAMPOS NUEVOS
         nueva_poliza = Poliza(
             cliente_id=cliente.id,
             compania_id=compania_id,
             numero_poliza=datos['poliza'],
-            fecha_inicio=fecha_desde,          # <--- Ajustado a tu BD
-            fecha_fin_vigencia=fecha_hasta,    # <--- Ajustado a tu BD
+            fecha_inicio=fecha_desde,
+            fecha_fin_vigencia=fecha_hasta,
             estado_vigencia="VIGENTE",
             saldo_adeudado=0,
-            is_enabled=True
+            is_enabled=True,
+            periodo_facturacion=datos.get('periodo_facturacion', 'S/D'),
+            forma_pago=datos.get('forma_pago', 'S/D'),
+            pdf_url=datos.get('pdf_url', None)  # <--- GUARDADO EN NEON DB
         )
         db.add(nueva_poliza)
-        db.flush() # Guardamos para tener el nueva_poliza.id
+        db.flush()
 
-        # 5. Crear el Bien Asegurado
         nuevo_bien = BienAsegurado(
             poliza_id=nueva_poliza.id,
             tipo=datos.get('tipo_seguro', 'Automotor'),
@@ -552,10 +630,8 @@ async def save_poliza(datos: dict):
         )
         db.add(nuevo_bien)
 
-        # 6. Confirmar todo el paquete junto
         db.commit()
-        
-        return {"status": "success", "message": "Póliza y Bien Asegurado vinculados correctamente"}
+        return {"status": "success", "message": "Póliza y PDF vinculados correctamente"}
     except Exception as e:
         db.rollback()
         print(f"🚨 Error en save-poliza: {str(e)}") 

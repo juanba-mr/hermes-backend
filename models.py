@@ -54,6 +54,10 @@ class Poliza(Base):
     
     datos_especificos = Column(JSONB, default=dict)
     
+    periodo_facturacion = Column(String(50), nullable=True, default="S/D")
+    forma_pago = Column(String(50), nullable=True, default="S/D")
+    pdf_url = Column(String, nullable=True)
+    
     is_enabled = Column(Boolean, default=True, nullable=False) 
     created_at = Column(DateTime, default=datetime.utcnow)
     updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)

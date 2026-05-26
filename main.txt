@@ -15,6 +15,7 @@ from auth import crear_token_acceso, verificar_token
 import PyPDF2
 from io import BytesIO
 from google import genai
+from supabase import create_client, Client
 
 # Importamos tus modelos (asegúrate de que el archivo se llame models.py)
 from models import Cliente, Poliza, Compania, BienAsegurado, UsuarioAdmin, SuscripcionPush
@@ -52,6 +53,11 @@ app.add_middleware(
 )
 # Esto le dice a FastAPI que busque el "Candadito" en la documentación (Swagger)
 security = HTTPBearer()
+
+# Inicialización del cliente de Supabase Storage
+SUPABASE_URL = os.getenv("SUPABASE_URL")
+SUPABASE_KEY = os.getenv("SUPABASE_KEY")
+supabase_client: Client = create_client(SUPABASE_URL, SUPABASE_KEY) if SUPABASE_URL else None
 
 def obtener_usuario_actual(res: HTTPAuthorizationCredentials = Security(security)):
     """
@@ -254,18 +260,28 @@ def get_admin_clientes(usuario: dict = Depends(obtener_usuario_actual)):
     
     db = SessionLocal()
     try:
-        clientes = db.query(Cliente).all()
+        # Usamos joinedload para que traiga las pólizas y compañías súper rápido
+        clientes = db.query(Cliente).options(joinedload(Cliente.polizas).joinedload(Poliza.compania)).all()
         result = []
         for c in clientes:
-            # Calculamos cuántas pólizas tiene cada uno
-            cant_polizas = len([p for p in c.polizas if p.is_enabled])
+            polizas_activas = [p for p in c.polizas if p.is_enabled]
+            cant_polizas = len(polizas_activas)
+            
+            # Recolectamos datos únicos de este cliente para los filtros
+            companias = list(set([p.compania.nombre for p in polizas_activas if p.compania]))
+            formas_pago = list(set([p.forma_pago for p in polizas_activas if getattr(p, 'forma_pago', None) and p.forma_pago != 'S/D']))
+            estados = list(set([p.estado_vigencia for p in polizas_activas if p.estado_vigencia]))
+            
             result.append({
                 "id": str(c.id),
                 "dni": c.dni,
                 "nombre": c.nombre_completo,
                 "telefono": c.telefono or "Sin teléfono",
                 "cant_polizas": cant_polizas,
-                "estado": "Activo" if c.is_active else "Inactivo"
+                "estado": "Activo" if c.is_active else "Inactivo",
+                "companias": companias,
+                "formas_pago": formas_pago,
+                "estados_polizas": estados
             })
         return result
     finally:
@@ -447,22 +463,50 @@ async def upload_poliza(file: UploadFile = File(...)):
             
         client = genai.Client(api_key=clave_ia)
         
+        # PROMPT MEJORADO: Ahora Gemini detecta la compañía basándose en firmas, textos
         prompt = f"""
-        Eres un asistente experto en seguros de Argentina. Analiza el siguiente texto extraído de una póliza de seguros y extrae EXCLUSIVAMENTE los siguientes datos.
-        
-        Devuelve el resultado ÚNICAMENTE en un formato JSON válido, sin usar markdown ni comillas invertidas, con esta estructura exacta:
+        Eres un asistente experto y analítico en seguros de Argentina.
+        Tu tarea es leer la póliza adjunta, deducir la información oculta siguiendo ESTRICTAMENTE las reglas de negocio, y devolver los datos en formato JSON.
+
+        REGLAS DE COMPAÑÍA:
+        - Si menciona "Río Uruguay", "RUS" o su CUIT, compania es "RUS".
+        - Si menciona "Antártida" o su CUIT, compania es "ANTARTIDA".
+
+        REGLAS DE FORMA DE PAGO:
+        - Si el texto dice "PAGO MANUAL", "Ventanilla", "Rapipago", "Pago Fácil" o menciona pago en efectivo/billetera virtual, forma_pago es "Efectivo".
+        - Si el texto dice "Débito Automático", "CBU", "Tarjeta", "Visa", "Mastercard", etc., forma_pago es "Tarjeta de Crédito / Débito".
+
+        REGLAS AVANZADAS PARA EL PERÍODO DE FACTURACIÓN (¡ATENCIÓN A ESTO!):
+        Debes cruzar la información del tipo de vehículo, la compañía y si hay cuotas para deducir el período. Analiza el cronograma de pagos y las fechas de vigencia:
+
+        1. REGLA PARA MOTOS (Cualquier compañía):
+           - Las pólizas de motos NUNCA son mes a mes. SIEMPRE son en 1 solo pago.
+           - Según la diferencia entre vigencia_desde y vigencia_hasta, periodo_facturacion DEBE ser: "Bimestral", "Cuatrimestral" o "Semestral".
+
+        2. REGLAS PARA AUTOS EN ANTÁRTIDA:
+           - Si la póliza dura 2 meses y se abona en 1 SOLO PAGO (no hay cronograma de cuotas mensuales): periodo_facturacion = "Bimestral".
+           - Si la póliza dura 2 meses pero se abona "MES A MES" (hay 2 cuotas o vencimientos mensuales): periodo_facturacion = "Bimestral 2".
+
+        3. REGLAS PARA AUTOS EN RUS:
+           - Si la póliza dura 2 meses y se abona en 1 SOLO PAGO: periodo_facturacion = "Bimestral".
+           - Si la póliza se abona "MES A MES" (cuotas mensuales): periodo_facturacion = "Mensual".
+
+        ESTRUCTURA EXACTA REQUERIDA:
         {{
             "nombre": "Nombre completo del asegurado",
-            "dni": "Número de DNI exacto (suele tener 8 dígitos). NO pongas el CUIT completo. Si el texto tiene DNI y CUIT, elige el DNI. Si SOLO hay CUIT de 11 dígitos, extrae únicamente los 8 números centrales (ese es el DNI).",
-            "poliza": "Número de la póliza",
-            "tipo_seguro": "Categoriza el seguro leyendo el texto (ej: Automotor, Vida, Accidentes Personales, Sepelio, Integrales de Comercio, ART, etc.)",
-            "patente": "Patente del vehículo (solo si es Automotor, de lo contrario déjalo vacío)",
-            "vehiculo": "Marca y modelo (solo si es Automotor, de lo contrario déjalo vacío)",
+            "dni": "Número de DNI de 8 dígitos (solo los 8 centrales si es CUIT)",
+            "poliza": "Número exacto de la póliza",
+            "compania": "RUS o ANTARTIDA",
+            "tipo_seguro": "Clasifica estrictamente como 'Automotor' (para autos/camionetas) o 'Moto' (para motocicletas)",
+            "patente": "Patente del vehículo",
+            "vehiculo": "Marca y modelo",
             "vigencia_desde": "Fecha en formato DD/MM/AAAA",
-            "vigencia_hasta": "Fecha en formato DD/MM/AAAA"
+            "vigencia_hasta": "Fecha en formato DD/MM/AAAA",
+            "periodo_facturacion": "Aplica las reglas avanzadas (Ej: Bimestral, Bimestral 2, Cuatrimestral, Semestral, Mensual)",
+            "forma_pago": "Efectivo o Tarjeta de Crédito / Débito"
         }}
         
-        Texto de la póliza:
+        Texto de la póliza a analizar:
         {texto_extraido}
         """
 
