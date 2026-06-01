@@ -16,6 +16,7 @@ class Cliente(Base):
     telefono = Column(String(50), nullable=True)
     email = Column(String(100), nullable=True)
     perfil_extra = Column(JSONB, default=dict) 
+    sucursal_id = Column(String, ForeignKey("sucursales.id"), nullable=True)
     
     is_active = Column(Boolean, default=True, nullable=False)
     created_at = Column(DateTime, default=datetime.utcnow)
@@ -23,6 +24,8 @@ class Cliente(Base):
     deleted_at = Column(DateTime, nullable=True)
 
     polizas = relationship("Poliza", back_populates="cliente", cascade="all, delete-orphan")
+    sucursal = relationship("Sucursal", back_populates="clientes")
+    mensajes = relationship("Mensaje", back_populates="cliente", cascade="all, delete-orphan")
 
 
 class Compania(Base):
@@ -66,6 +69,7 @@ class Poliza(Base):
     cliente = relationship("Cliente", back_populates="polizas")
     compania = relationship("Compania", back_populates="polizas")
     bien_asegurado = relationship("BienAsegurado", uselist=False, back_populates="poliza")
+    
 
     __table_args__ = (
         Index('ix_poliza_active_lookup', 'numero_poliza', 'is_enabled'),
@@ -107,3 +111,29 @@ class SuscripcionPush(Base):
     cliente_dni = Column(String(20), index=True) # A quién pertenece este celular
     datos_navegador = Column(Text, nullable=False) # El JSON gigante que nos da Chrome/Safari
     created_at = Column(DateTime, default=datetime.utcnow)
+    
+class Sucursal(Base):
+    __tablename__ = "sucursales"
+
+    id = Column(String, primary_key=True, default=lambda: str(uuid.uuid4()))
+    nombre = Column(String, nullable=False) # Ej: "San Luis Centro"
+    telefono_whatsapp = Column(String, nullable=False) # Ej: "5492664372561"
+    direccion = Column(String, nullable=True) # Ej: "Av. Illia 123"
+    email = Column(String, nullable=True)
+    is_active = Column(Boolean, default=True)
+
+    # Relación: Una sucursal tiene muchos clientes
+    clientes = relationship("Cliente", back_populates="sucursal")
+    
+class Mensaje(Base):
+    __tablename__ = 'mensajes'
+    
+    id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    cliente_id = Column(UUID(as_uuid=True), ForeignKey('clientes.id'))
+    titulo = Column(String)
+    cuerpo = Column(Text)
+    fecha_creacion = Column(DateTime, default=datetime.utcnow)
+    leido = Column(Boolean, default=False)
+    
+    # Relación inversa
+    cliente = relationship("Cliente", back_populates="mensajes")

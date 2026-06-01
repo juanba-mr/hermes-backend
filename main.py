@@ -18,7 +18,7 @@ from google import genai
 from supabase import create_client, Client
 
 # Importamos tus modelos (asegúrate de que el archivo se llame models.py)
-from models import Cliente, Poliza, Compania, BienAsegurado, UsuarioAdmin, SuscripcionPush
+from models import Cliente, Poliza, Compania, BienAsegurado, UsuarioAdmin, SuscripcionPush, Sucursal, Mensaje
 
 # 1. Configuración de Base de Datos
 load_dotenv()
@@ -58,11 +58,6 @@ app.add_middleware(
 )
 # Esto le dice a FastAPI que busque el "Candadito" en la documentación (Swagger)
 security = HTTPBearer()
-
-# Inicialización del cliente de Supabase Storage
-SUPABASE_URL = os.getenv("SUPABASE_URL")
-SUPABASE_KEY = os.getenv("SUPABASE_KEY")
-supabase_client: Client = create_client(SUPABASE_URL, SUPABASE_KEY) if SUPABASE_URL else None
 
 def obtener_usuario_actual(res: HTTPAuthorizationCredentials = Security(security)):
     """
@@ -152,8 +147,10 @@ def get_perfil_cliente(dni: str, usuario: dict = Depends(obtener_usuario_actual)
 
     db = SessionLocal()
     try:
-        # Usamos joinedload para traer las pólizas y compañías de un solo viaje
-        cliente = db.query(Cliente).filter(Cliente.dni == dni).first()
+        # Usamos joinedload para traer la sucursal, las pólizas y compañías de un solo viaje
+        cliente = db.query(Cliente).options(
+            joinedload(Cliente.sucursal)
+        ).filter(Cliente.dni == dni).first()
         
         if not cliente:
             raise HTTPException(status_code=404, detail="Cliente no encontrado")
@@ -183,7 +180,21 @@ def get_perfil_cliente(dni: str, usuario: dict = Depends(obtener_usuario_actual)
         return {
             "dni": cliente.dni,
             "nombre": cliente.nombre_completo,
-            "polizas": polizas_data
+            "sucursal": {
+                "id": str(cliente.sucursal.id) if cliente.sucursal else None,
+                "nombre": cliente.sucursal.nombre if cliente.sucursal else "Central",
+                "telefono_whatsapp": cliente.sucursal.telefono_whatsapp if cliente.sucursal else "5491100000000" # Fallback de seguridad
+            },
+            "polizas": polizas_data,
+            "mensajes": [
+            {
+                "id": str(m.id),
+                "titulo": m.titulo,
+                "cuerpo": m.cuerpo,
+                "fecha": m.fecha_creacion.isoformat(),
+                "leido": m.leido
+            } for m in sorted(cliente.mensajes, key=lambda x: x.fecha_creacion, reverse=True)
+        ]
         }
     finally:
         db.close()
@@ -267,8 +278,11 @@ def get_admin_clientes(usuario: dict = Depends(obtener_usuario_actual)):
     
     db = SessionLocal()
     try:
-        # Usamos joinedload para que traiga las pólizas y compañías súper rápido
-        clientes = db.query(Cliente).options(joinedload(Cliente.polizas).joinedload(Poliza.compania)).all()
+        # Usamos joinedload para que traiga sucursal, pólizas y compañías súper rápido
+        clientes = db.query(Cliente).options(
+            joinedload(Cliente.sucursal),
+            joinedload(Cliente.polizas).joinedload(Poliza.compania)
+        ).all()
         result = []
         for c in clientes:
             polizas_activas = [p for p in c.polizas if p.is_enabled]
@@ -284,6 +298,7 @@ def get_admin_clientes(usuario: dict = Depends(obtener_usuario_actual)):
                 "dni": c.dni,
                 "nombre": c.nombre_completo,
                 "telefono": c.telefono or "Sin teléfono",
+                "sucursal_nombre": c.sucursal.nombre if c.sucursal else "Sin asignar",
                 "cant_polizas": cant_polizas,
                 "estado": "Activo" if c.is_active else "Inactivo",
                 "companias": companias,
@@ -435,6 +450,14 @@ def disparar_alerta_inteligente(id_poliza: str, usuario: dict = Depends(obtener_
             
         # 4. Convertimos el JSON guardado en diccionario y mandamos
         suscripcion_real = json.loads(suscripcion_db.datos_navegador)
+        
+        nuevo_mensaje = Mensaje(
+            cliente_id=cliente.id,
+            titulo=f"Aviso de Renovación: {poliza.compania.nombre}",
+            cuerpo=mensaje_magico
+        )
+        db.add(nuevo_mensaje)
+        db.commit()        
         
         enviado = enviar_alerta_push(
             suscripcion_json=suscripcion_real, # <--- USAMOS LA REAL
@@ -591,6 +614,7 @@ async def save_poliza(datos: dict):
                 dni=datos['dni'],
                 telefono="", 
                 is_active=True
+                # sucursal_id podría definirse por defecto acá si se requiere más adelante
             )
             db.add(cliente)
             db.flush()
@@ -639,4 +663,29 @@ async def save_poliza(datos: dict):
     finally:
         db.close()
 
+
+@app.put("/api/mensajes/{id_mensaje}/leer")
+def marcar_mensaje_leido(id_mensaje: str, usuario: dict = Depends(obtener_usuario_actual)):
+    db = SessionLocal()
+    try:
+        # Buscamos el mensaje por su UUID
+        mensaje = db.query(Mensaje).filter(Mensaje.id == id_mensaje).first()
+        if not mensaje:
+            raise HTTPException(status_code=404, detail="Mensaje no encontrado")
+            
+        # Validación estricta: si es cliente, comprobamos que el mensaje le pertenezca a su DNI
+        if usuario["rol"] == "cliente" and str(mensaje.cliente.dni) != usuario["sub"]:
+            raise HTTPException(status_code=403, detail="No tienes permiso para modificar este mensaje")
+
+        # Si no está leído, lo actualizamos y disparamos el commit a Neon DB
+        if not mensaje.leido:
+            mensaje.leido = True
+            db.commit()
+            
+        return {"success": True, "leido": True}
+    except Exception as e:
+        db.rollback()
+        raise HTTPException(status_code=500, detail=str(e))
+    finally:
+        db.close()
 # Para ejecutar: uvicorn main:app --reload
