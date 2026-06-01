@@ -51,7 +51,10 @@ def health_check():
 # Esto permite que tu frontend en el puerto 5173 pueda hablar con este servidor
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"], 
+    allow_origins=[
+        "http://localhost:5173", 
+        "https://panel.franciseguros.com.ar" # <-- Tu nuevo subdominio acá
+    ],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
