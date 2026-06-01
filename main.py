@@ -53,7 +53,7 @@ app.add_middleware(
     CORSMiddleware,
     allow_origins=[
         "http://localhost:5173", 
-        "https://panel.franciseguros.com.ar" # <-- Tu nuevo subdominio acá
+        "https://app.hermesasesores.com.ar" # <-- Tu nuevo subdominio acá
     ],
     allow_credentials=True,
     allow_methods=["*"],
