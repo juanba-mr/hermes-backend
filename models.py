@@ -104,6 +104,9 @@ class UsuarioAdmin(Base):
     created_at = Column(DateTime, default=datetime.utcnow)
     updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
     
+    sucursal_id = Column(String(255), ForeignKey('sucursales.id', ondelete='SET NULL'), nullable=True)
+    sucursal = relationship("Sucursal", back_populates="admins")
+    
 class SuscripcionPush(Base):
     __tablename__ = 'suscripciones_push'
 
@@ -115,7 +118,7 @@ class SuscripcionPush(Base):
 class Sucursal(Base):
     __tablename__ = "sucursales"
 
-    id = Column(String, primary_key=True, default=lambda: str(uuid.uuid4()))
+    id = Column(String(255), primary_key=True)
     nombre = Column(String, nullable=False) # Ej: "San Luis Centro"
     telefono_whatsapp = Column(String, nullable=False) # Ej: "5492664372561"
     direccion = Column(String, nullable=True) # Ej: "Av. Illia 123"
@@ -124,6 +127,7 @@ class Sucursal(Base):
 
     # Relación: Una sucursal tiene muchos clientes
     clientes = relationship("Cliente", back_populates="sucursal")
+    admins = relationship("UsuarioAdmin", back_populates="sucursal")
     
 class Mensaje(Base):
     __tablename__ = 'mensajes'

@@ -96,7 +96,8 @@ def login_usuario(request: LoginRequest):
             token = crear_token_acceso(data={
                 "sub": str(admin.id), 
                 "rol": admin.rol, 
-                "nombre": admin.nombre_completo
+                "nombre": admin.nombre_completo,
+                "sucursal_id": str(admin.sucursal_id) if admin.sucursal_id else None # <--- ACÁ
             })
             return {
                 "success": True,
@@ -106,7 +107,8 @@ def login_usuario(request: LoginRequest):
                     "id": str(admin.id),
                     "nombre": admin.nombre_completo,
                     "dni": admin.dni_acceso,
-                    "rol": admin.rol
+                    "rol": admin.rol,
+                    "sucursal_id": str(admin.sucursal_id) if admin.sucursal_id else None
                 }
             }
 
@@ -538,10 +540,25 @@ async def upload_poliza(file: UploadFile = File(...)):
         """
 
         # 2. Llamada a Gemini
-        response = client.models.generate_content(
-            model='gemini-flash-latest',
-            contents=prompt
-        )
+        modelos_fallback = ['gemini-2.5-flash', 'gemini-flash-latest', 'gemini-2-flash']
+        response = None
+        
+        for modelo in modelos_fallback:
+            try:
+                print(f"🧠 Intentando extraer datos con el modelo compatible: {modelo}...")
+                response = client.models.generate_content(
+                    model=modelo,
+                    contents=prompt
+                )
+                break 
+            except Exception as e:
+                error_msg = str(e)
+                print(f"⚠️ El modelo {modelo} falló o no está disponible: {error_msg}")
+                if "503" not in error_msg and "429" not in error_msg and "UNAVAILABLE" not in error_msg and "not found" not in error_msg:
+                    raise Exception(f"Falla crítica en la API de Gemini: {error_msg}")
+                    
+        if not response:
+            raise HTTPException(status_code=503, detail="Los servicios de procesamiento de IA de Google no se encuentran disponibles. Reintentá la carga en unos instantes.")
         
         # 3. Tu extracción vieja y confiable
         texto_json = response.text.strip()
@@ -601,23 +618,38 @@ async def upload_poliza(file: UploadFile = File(...)):
         raise HTTPException(status_code=500, detail=f"La IA falló: {str(e)}")
 
 @app.post("/api/save-poliza")
-async def save_poliza(datos: dict):
+async def save_poliza(datos: dict, usuario: dict = Depends(obtener_usuario_actual)):
     db = SessionLocal()
     try:
+        admin_id = usuario.get("sub")
+        admin_rol = usuario.get("rol")
+        
+        sucursal_admin_id = usuario.get("sucursal_id")
+        if admin_rol in ["ADMIN", "SUPERADMIN"]:
+            admin_obj = db.query(UsuarioAdmin).filter(UsuarioAdmin.id == admin_id).first()
+            if admin_obj:
+                # Forzamos conversión a string limpio por si las moscas
+                sucursal_admin_id = str(admin_obj.sucursal_id) if admin_obj.sucursal_id else None
+
         fecha_desde = datetime.strptime(datos['vigencia_desde'], "%d/%m/%Y").date()
         fecha_hasta = datetime.strptime(datos['vigencia_hasta'], "%d/%m/%Y").date()
 
         cliente = db.query(Cliente).filter(Cliente.dni == datos['dni']).first()
+        
         if not cliente:
             cliente = Cliente(
                 nombre_completo=datos['nombre'],
                 dni=datos['dni'],
                 telefono="", 
-                is_active=True
-                # sucursal_id podría definirse por defecto acá si se requiere más adelante
+                is_active=True,
+                sucursal_id=sucursal_admin_id 
             )
             db.add(cliente)
             db.flush()
+        else:
+            if not cliente.sucursal_id and sucursal_admin_id:
+                cliente.sucursal_id = sucursal_admin_id
+                db.flush()
 
         compania_id = None
         if datos.get('compania'):
@@ -628,7 +660,6 @@ async def save_poliza(datos: dict):
                 db.flush()
             compania_id = cia.id
 
-        # ACA AGREGAMOS LOS TRES CAMPOS NUEVOS
         nueva_poliza = Poliza(
             cliente_id=cliente.id,
             compania_id=compania_id,
@@ -640,7 +671,7 @@ async def save_poliza(datos: dict):
             is_enabled=True,
             periodo_facturacion=datos.get('periodo_facturacion', 'S/D'),
             forma_pago=datos.get('forma_pago', 'S/D'),
-            pdf_url=datos.get('pdf_url', None)  # <--- GUARDADO EN NEON DB
+            pdf_url=datos.get('pdf_url', None)  
         )
         db.add(nueva_poliza)
         db.flush()
