@@ -16,6 +16,9 @@ import PyPDF2
 from io import BytesIO
 from google import genai
 from supabase import create_client, Client
+import logging
+from typing import Optional
+
 
 # Importamos tus modelos (asegúrate de que el archivo se llame models.py)
 from models import Cliente, Poliza, Compania, BienAsegurado, UsuarioAdmin, SuscripcionPush, Sucursal, Mensaje
@@ -23,6 +26,10 @@ from models import Cliente, Poliza, Compania, BienAsegurado, UsuarioAdmin, Suscr
 # 1. Configuración de Base de Datos
 load_dotenv()
 DATABASE_URL = os.getenv("DATABASE_URL")
+
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
 
 # Neon requiere sslmode=require para conexiones seguras
 engine = create_engine(
@@ -46,6 +53,73 @@ app = FastAPI(title="Backend Hermes Seguros")
 @app.head("/")
 def health_check():
     return {"status": "ok", "mensaje": "El backend de Hermes está despierto."}
+
+# ARQUITECTURA DEFENSIVA: POOL DE MODELOS Y LLAVES
+
+class GeminiRotator:
+    def __init__(self):
+        key1 = os.getenv("GEMINI_API_KEY_PDF")
+        key2 = os.getenv("GEMINI_API_KEY_PDF_2")
+        
+        # Filtramos las keys que realmente existan en el .env
+        self.api_keys = [k for k in [key1, key2] if k]
+        if not self.api_keys:
+            raise ValueError("Falta configurar GEMINI_API_KEY_PDF en el archivo .env")
+
+        # Pool de 5 modelos funcionales validados
+        self.models = [
+            "gemini-3.5-flash",
+            "gemini-3.1-flash-lite",
+            "gemini-2.5-flash",
+            "gemini-2.5-flash-lite",
+            "gemini-flash-latest"
+        ]
+        
+        # Punteros de estado en memoria
+        self.current_key_idx = 0
+        self.current_model_idx = 0
+
+    def procesar_prompt(self, prompt: str) -> str:
+        consecutive_failures = 0
+        total_combinations = len(self.api_keys) * len(self.models)
+
+        while consecutive_failures < total_combinations:
+            current_key = self.api_keys[self.current_key_idx]
+            current_model = self.models[self.current_model_idx]
+
+            try:
+                client = genai.Client(api_key=current_key)
+                response = client.models.generate_content(
+                    model=current_model,
+                    contents=prompt
+                )
+                return response.text
+
+            except Exception as e:
+                logger.warning(f"⚠️ [APIError] Fallo en {current_model} (Key {self.current_key_idx + 1}). Error: {e}. Rotando modelo...")
+                
+                # Desplazamiento al siguiente modelo
+                self.current_model_idx += 1
+                consecutive_failures += 1
+
+                # Si agotamos los 5 modelos de esta Key, saltamos a la siguiente Key
+                if self.current_model_idx >= len(self.models):
+                    self.current_model_idx = 0
+                    self.current_key_idx += 1
+                    logger.warning(f"🔄 Pool agotado para la Key actual. Conmutando a Key {self.current_key_idx + 1}...")
+
+                    # Si llegamos al final de la lista de Keys, volvemos a empezar el índice 
+                    # (aunque el bucle while cortará si se alcanzan fallos consecutivos máximos)
+                    if self.current_key_idx >= len(self.api_keys):
+                        self.current_key_idx = 0
+
+        # Excepción crítica final si todo el pool de ambas keys fracasa
+        raise Exception("CRÍTICO: Ambas API Keys agotaron sus 5 modelos de manera consecutiva. Sugerencia: Configurar facturación comercial o pausar ingesta.")
+
+# Instanciamos el motor en memoria al arrancar el servidor
+ia_motor = GeminiRotator()
+
+
 
 # 2. Configuración de CORS
 # Esto permite que tu frontend en el puerto 5173 pueda hablar con este servidor
@@ -314,6 +388,99 @@ def get_admin_clientes(usuario: dict = Depends(obtener_usuario_actual)):
     finally:
         db.close()
 
+class ClienteABM(BaseModel):
+    nombre: str
+    dni: str
+    telefono: Optional[str] = None
+    email: Optional[str] = None
+
+# ENDPOINT: CREAR NUEVO CLIENTE (POST)
+# ========================================================
+@app.post("/api/admin/clientes")
+def crear_cliente(datos: ClienteABM, usuario: dict = Depends(obtener_usuario_actual)):
+    if usuario["rol"].lower() not in ["admin", "superadmin"]:
+        raise HTTPException(status_code=403, detail="Acceso exclusivo para administradores")
+    
+    db = SessionLocal()
+    try:
+        # Verificamos que no exista un cliente con ese DNI
+        existe = db.query(Cliente).filter(Cliente.dni == datos.dni).first()
+        if existe:
+            raise HTTPException(status_code=400, detail="Ya existe un cliente registrado con este DNI")
+
+        # Creamos el nuevo cliente
+        nuevo_cliente = Cliente(
+            nombre_completo=datos.nombre,
+            dni=datos.dni,
+            telefono=datos.telefono or "",
+            email=datos.email or "", # Descomentá esta línea si tenés la columna 'email' en tu base de datos Neon
+            is_active=True,
+            sucursal_id=usuario.get("sucursal_id")
+        )
+        db.add(nuevo_cliente)
+        db.commit()
+        return {"success": True, "message": "Cliente creado correctamente"}
+    except Exception as e:
+        db.rollback()
+        raise HTTPException(status_code=500, detail=str(e))
+    finally:
+        db.close()
+
+
+# ========================================================
+# ENDPOINT: EDITAR CLIENTE EXISTENTE (PUT)
+# ========================================================
+@app.put("/api/admin/clientes/{dni}")
+def actualizar_cliente(dni: str, datos: ClienteABM, usuario: dict = Depends(obtener_usuario_actual)):
+    if usuario["rol"].lower() not in ["admin", "superadmin"]:
+        raise HTTPException(status_code=403, detail="Acceso exclusivo para administradores")
+    
+    db = SessionLocal()
+    try:
+        cliente = db.query(Cliente).filter(Cliente.dni == dni).first()
+        if not cliente:
+            raise HTTPException(status_code=404, detail="Cliente no encontrado")
+
+        # Actualizamos los datos
+        cliente.nombre_completo = datos.nombre
+        cliente.telefono = datos.telefono or ""
+        cliente.email = datos.email or "" # Descomentá esta línea si tenés la columna 'email' en tu base de datos Neon
+        
+        db.commit()
+        return {"success": True, "message": "Cliente actualizado correctamente"}
+    except Exception as e:
+        db.rollback()
+        raise HTTPException(status_code=500, detail=str(e))
+    finally:
+        db.close()
+
+
+# ========================================================
+# ENDPOINT: ELIMINAR CLIENTE (DELETE)
+# ========================================================
+@app.delete("/api/admin/clientes/{dni}")
+def eliminar_cliente(dni: str, usuario: dict = Depends(obtener_usuario_actual)):
+    if usuario["rol"].lower() not in ["admin", "superadmin"]:
+        raise HTTPException(status_code=403, detail="Acceso exclusivo para administradores")
+    
+    db = SessionLocal()
+    try:
+        cliente = db.query(Cliente).filter(Cliente.dni == dni).first()
+        if not cliente:
+            raise HTTPException(status_code=404, detail="Cliente no encontrado")
+
+        # SOFT DELETE: En sistemas de seguros nunca borramos el registro físicamente
+        # para no romper el historial de pólizas. Simplemente lo desactivamos.
+        cliente.is_active = False
+        db.commit()
+        return {"success": True, "message": "Cliente eliminado correctamente"}
+    except Exception as e:
+        db.rollback()
+        raise HTTPException(status_code=500, detail=str(e))
+    finally:
+        db.close()
+
+
 # 9. ENDPOINT: Pólizas a renovar (Próximos 30 días)
 @app.get("/api/admin/renovaciones")
 def get_renovaciones(usuario: dict = Depends(obtener_usuario_actual)):
@@ -488,13 +655,7 @@ async def upload_poliza(file: UploadFile = File(...)):
         texto_extraido = ""
         for i in range(min(5, len(lector.pages))):
             texto_extraido += lector.pages[i].extract_text()
-
-        clave_ia = os.getenv("GEMINI_API_KEY_PDF")
-        if not clave_ia:
-            raise HTTPException(status_code=500, detail="Falta la API Key en el archivo .env")
-            
-        client = genai.Client(api_key=clave_ia)
-        
+       
         # PROMPT (Tu versión mejorada)
         prompt = f"""
         Eres un asistente experto y analítico en seguros de Argentina.
@@ -542,29 +703,11 @@ async def upload_poliza(file: UploadFile = File(...)):
         {texto_extraido}
         """
 
-        # 2. Llamada a Gemini
-        modelos_fallback = ['gemini-2.5-flash', 'gemini-flash-latest', 'gemini-2-flash']
-        response = None
+        # 2. Llamada a Gemini usando nuestra Arquitectura Defensiva
+        texto_crudo = ia_motor.procesar_prompt(prompt)
         
-        for modelo in modelos_fallback:
-            try:
-                print(f"🧠 Intentando extraer datos con el modelo compatible: {modelo}...")
-                response = client.models.generate_content(
-                    model=modelo,
-                    contents=prompt
-                )
-                break 
-            except Exception as e:
-                error_msg = str(e)
-                print(f"⚠️ El modelo {modelo} falló o no está disponible: {error_msg}")
-                if "503" not in error_msg and "429" not in error_msg and "UNAVAILABLE" not in error_msg and "not found" not in error_msg:
-                    raise Exception(f"Falla crítica en la API de Gemini: {error_msg}")
-                    
-        if not response:
-            raise HTTPException(status_code=503, detail="Los servicios de procesamiento de IA de Google no se encuentran disponibles. Reintentá la carga en unos instantes.")
-        
-        # 3. Tu extracción vieja y confiable
-        texto_json = response.text.strip()
+        # 3. Extracción limpia del JSON
+        texto_json = texto_crudo.strip()
         if texto_json.startswith("```json"):
             texto_json = texto_json[7:-3] 
         elif texto_json.startswith("```"):
@@ -572,22 +715,44 @@ async def upload_poliza(file: UploadFile = File(...)):
             
         datos_poliza = json.loads(texto_json)
         
+        datos_poliza["poliza"] = str(datos_poliza.get("poliza", "")).strip()
+        
         # =========================================================
-        # 4. SUBIDA A SUPABASE CON MANEJO DE ERRORES SEGURO
+        # 4. SUBIDA DIRECTA A LA API REST (PUENTEANDO LA LIBRERÍA)
         # =========================================================
         datos_poliza["pdf_url"] = None 
         
+        # CHECK DE DUPLICADOS Y RENOVACIONES EN LA BASE DE DATOS
+        db = SessionLocal()
         try:
-            import requests
+            poliza_db = db.query(Poliza).filter(Poliza.numero_poliza == datos_poliza["poliza"]).first()
+            if poliza_db:
+                # Comparamos las fechas
+                try:
+                    fecha_hasta_nueva = datetime.strptime(datos_poliza['vigencia_hasta'], "%d/%m/%Y").date()
+                    if fecha_hasta_nueva > poliza_db.fecha_fin_vigencia:
+                        datos_poliza["estado_db"] = "renovacion"
+                        datos_poliza["mensaje_db"] = "✅ Renovación detectada: Se actualizarán las fechas."
+                    else:
+                        datos_poliza["estado_db"] = "duplicado"
+                        datos_poliza["mensaje_db"] = "⚠️ Esta póliza ya existe con la misma vigencia (o una superior)."
+                except Exception:
+                    # Si falla el parseo de fecha, por las dudas marcamos como duplicado
+                    datos_poliza["estado_db"] = "duplicado"
+                    datos_poliza["mensaje_db"] = "⚠️ Póliza ya existente en el sistema."
+            else:
+                datos_poliza["estado_db"] = "nueva"
+                datos_poliza["mensaje_db"] = "✨ Póliza nueva lista para guardar."
+        finally:
+            db.close()
+        
+        try:
+            import requests  # <--- ACÁ ESTÁ DE VUELTA LA MAGIA
             
             # Limpiamos el nombre para que la URL no se rompa
             nombre_archivo = f"{datos_poliza.get('compania', 'SD')}_{datos_poliza.get('poliza', 'SD')}.pdf"
             nombre_archivo = nombre_archivo.replace(" ", "_").replace("/", "-")
             
-            SUPABASE_URL = os.getenv("SUPABASE_URL")
-            SUPABASE_KEY = os.getenv("SUPABASE_KEY")
-            
-            # EL FIX ESTÁ ACÁ: El path correcto de la API es /storage/v1/object/nombre_del_bucket/nombre_del_archivo
             url_subida = f"{SUPABASE_URL}/storage/v1/object/polizas/{nombre_archivo}"
             
             # Cabeceras obligatorias imitando el comportamiento de la librería
@@ -624,6 +789,7 @@ async def upload_poliza(file: UploadFile = File(...)):
 async def save_poliza(datos: dict, usuario: dict = Depends(obtener_usuario_actual)):
     db = SessionLocal()
     try:
+        # 1. MANTENEMOS TU LÓGICA DE USUARIO Y SUCURSAL
         admin_id = usuario.get("sub")
         admin_rol = usuario.get("rol")
         
@@ -634,9 +800,14 @@ async def save_poliza(datos: dict, usuario: dict = Depends(obtener_usuario_actua
                 # Forzamos conversión a string limpio por si las moscas
                 sucursal_admin_id = str(admin_obj.sucursal_id) if admin_obj.sucursal_id else None
 
+        numero_poliza_limpio = str(datos.get('poliza', '')).strip()
+        datos['poliza'] = numero_poliza_limpio
+        
+        # 2. PROCESAMIENTO DE FECHAS
         fecha_desde = datetime.strptime(datos['vigencia_desde'], "%d/%m/%Y").date()
         fecha_hasta = datetime.strptime(datos['vigencia_hasta'], "%d/%m/%Y").date()
 
+        # 3. MANTENEMOS TU LÓGICA DE CLIENTE
         cliente = db.query(Cliente).filter(Cliente.dni == datos['dni']).first()
         
         if not cliente:
@@ -654,6 +825,7 @@ async def save_poliza(datos: dict, usuario: dict = Depends(obtener_usuario_actua
                 cliente.sucursal_id = sucursal_admin_id
                 db.flush()
 
+        # 4. MANTENEMOS TU LÓGICA DE COMPAÑÍA
         compania_id = None
         if datos.get('compania'):
             cia = db.query(Compania).filter(Compania.nombre == datos['compania']).first()
@@ -663,33 +835,56 @@ async def save_poliza(datos: dict, usuario: dict = Depends(obtener_usuario_actua
                 db.flush()
             compania_id = cia.id
 
-        nueva_poliza = Poliza(
-            cliente_id=cliente.id,
-            compania_id=compania_id,
-            numero_poliza=datos['poliza'],
-            fecha_inicio=fecha_desde,
-            fecha_fin_vigencia=fecha_hasta,
-            estado_vigencia="VIGENTE",
-            saldo_adeudado=0,
-            is_enabled=True,
-            periodo_facturacion=datos.get('periodo_facturacion', 'S/D'),
-            forma_pago=datos.get('forma_pago', 'S/D'),
-            pdf_url=datos.get('pdf_url', None)  
-        )
-        db.add(nueva_poliza)
-        db.flush()
+        # 5. NUEVA LÓGICA DE UPSERT (ACTUALIZAR O INSERTAR PÓLIZA)
+        poliza_existente = db.query(Poliza).filter(Poliza.numero_poliza == numero_poliza_limpio).first()
+        
+        if poliza_existente:
+            # Es una RENOVACIÓN o actualización: Pisamos los datos viejos
+            poliza_existente.fecha_inicio = fecha_desde
+            poliza_existente.fecha_fin_vigencia = fecha_hasta
+            poliza_existente.periodo_facturacion = datos.get('periodo_facturacion', poliza_existente.periodo_facturacion)
+            poliza_existente.forma_pago = datos.get('forma_pago', poliza_existente.forma_pago)
+            
+            # Si subimos un PDF nuevo, actualizamos el link
+            if datos.get('pdf_url'):
+                poliza_existente.pdf_url = datos['pdf_url']
 
-        nuevo_bien = BienAsegurado(
-            poliza_id=nueva_poliza.id,
-            tipo=datos.get('tipo_seguro', 'Automotor'),
-            descripcion_modelo=datos.get('vehiculo', ''),
-            patente=datos.get('patente', ''),
-            detalles={}
-        )
-        db.add(nuevo_bien)
+            # Actualizamos el vehículo por si cambió
+            bien = db.query(BienAsegurado).filter(BienAsegurado.poliza_id == poliza_existente.id).first()
+            if bien:
+                bien.patente = datos.get('patente', bien.patente)
+                bien.descripcion_modelo = datos.get('vehiculo', bien.descripcion_modelo)
+        else:
+            # Es una póliza NUEVA: Creamos todo desde cero
+            nueva_poliza = Poliza(
+                cliente_id=cliente.id,
+                compania_id=compania_id,
+                numero_poliza=datos['poliza'],
+                fecha_inicio=fecha_desde,
+                fecha_fin_vigencia=fecha_hasta,
+                estado_vigencia="VIGENTE",
+                saldo_adeudado=0,
+                is_enabled=True,
+                periodo_facturacion=datos.get('periodo_facturacion', 'S/D'),
+                forma_pago=datos.get('forma_pago', 'S/D'),
+                pdf_url=datos.get('pdf_url', None)  
+            )
+            db.add(nueva_poliza)
+            db.flush()
 
+            nuevo_bien = BienAsegurado(
+                poliza_id=nueva_poliza.id,
+                tipo=datos.get('tipo_seguro', 'Automotor'),
+                descripcion_modelo=datos.get('vehiculo', ''),
+                patente=datos.get('patente', ''),
+                detalles={}
+            )
+            db.add(nuevo_bien)
+
+        # 6. CIERRE DE LA TRANSACCIÓN
         db.commit()
-        return {"status": "success", "message": "Póliza y PDF vinculados correctamente"}
+        return {"status": "success", "message": "Póliza procesada correctamente"}
+
     except Exception as e:
         db.rollback()
         print(f"🚨 Error en save-poliza: {str(e)}") 
