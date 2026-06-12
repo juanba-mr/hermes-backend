@@ -660,6 +660,11 @@ async def upload_poliza(file: UploadFile = File(...)):
         prompt = f"""
         Eres un asistente experto y analítico en seguros de Argentina.
         Tu tarea es leer la póliza adjunta, deducir la información oculta siguiendo ESTRICTAMENTE las reglas de negocio, y devolver los datos en formato JSON.
+        
+        REGLA CRÍTICA PARA EL DNI (¡NO ALUCINAR!):
+        - Extrae el número EXACTO que figura en el documento. NO inventes números.
+        - Si el documento muestra un CUIT (ejemplo: 20-35123456-9 o 20351234569), extrae ÚNICAMENTE los 8 dígitos centrales (35123456) y omite el prefijo (20, 23, 27) y el dígito verificador.
+        - El campo "dni" DEBE ser estrictamente una cadena de 7 u 8 números. No incluyas puntos ni letras.    
 
         REGLAS DE COMPAÑÍA:
         - Si menciona "Río Uruguay", "RUS" o su CUIT, compania es "RUS".
