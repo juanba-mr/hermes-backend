@@ -1,4 +1,4 @@
-from fastapi import FastAPI, HTTPException, Depends, Security, File, UploadFile
+from fastapi import FastAPI, HTTPException, Depends, Security, File, UploadFile, Form
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
@@ -18,6 +18,8 @@ from google import genai
 from supabase import create_client, Client
 import logging
 from typing import Optional
+import pandas as pd
+from parser import procesar_archivo_seguros
 
 
 # Importamos tus modelos (asegúrate de que el archivo se llame models.py)
@@ -789,6 +791,135 @@ async def upload_poliza(file: UploadFile = File(...)):
     except Exception as e:
         print(f"🚨 ERROR CRÍTICO EN IA: {str(e)}")
         raise HTTPException(status_code=500, detail=f"La IA falló: {str(e)}")
+
+@app.post("/api/admin/ingesta-masiva")
+async def ingesta_masiva(
+    file: UploadFile = File(...),
+    compania: str = Form(...),
+    usuario: dict = Depends(obtener_usuario_actual)
+):
+    import tempfile
+    import shutil
+    
+    if usuario["rol"].lower() not in ["admin", "superadmin"]:
+        raise HTTPException(status_code=403, detail="Acceso exclusivo para administradores")
+        
+    suffix = os.path.splitext(file.filename)[1].lower()
+    if suffix not in ['.csv', '.xls', '.xlsx']:
+        raise HTTPException(status_code=400, detail="El archivo debe ser un CSV, XLS o XLSX")
+
+    db = SessionLocal()
+    temp_file_path = None
+    try:
+        with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp:
+            shutil.copyfileobj(file.file, tmp)
+            temp_file_path = tmp.name
+
+        df = procesar_archivo_seguros(temp_file_path, compania)
+        
+        if df.empty:
+            raise HTTPException(status_code=400, detail="El archivo está vacío o no contiene registros válidos")
+
+        procesados = 0
+        admin_id = usuario.get("sub")
+        admin_rol = usuario.get("rol")
+        
+        sucursal_admin_id = usuario.get("sucursal_id")
+        if admin_rol.lower() in ["admin", "superadmin"]:
+            admin_obj = db.query(UsuarioAdmin).filter(UsuarioAdmin.id == admin_id).first()
+            if admin_obj:
+                sucursal_admin_id = str(admin_obj.sucursal_id) if admin_obj.sucursal_id else None
+
+        for _, row in df.iterrows():
+            dni_limpio = str(row['dni']).strip()
+            if not dni_limpio:
+                continue
+
+            # 1. COMPAÑÍA
+            cia_nombre = row['compania_nombre']
+            cia = db.query(Compania).filter(Compania.nombre == cia_nombre).first()
+            if not cia:
+                cia = Compania(nombre=cia_nombre, is_active=True)
+                db.add(cia)
+                db.flush()
+
+            # 2. CLIENTE
+            cliente = db.query(Cliente).filter(Cliente.dni == dni_limpio).first()
+            if not cliente:
+                cliente = Cliente(
+                    nombre_completo=row['nombre_completo'],
+                    dni=dni_limpio,
+                    telefono=row['telefono'] or "",
+                    email=row['email'] or "",
+                    is_active=True,
+                    sucursal_id=sucursal_admin_id
+                )
+                db.add(cliente)
+                db.flush()
+            else:
+                if row['telefono'] and not cliente.telefono:
+                    cliente.telefono = row['telefono']
+                if row['email'] and not cliente.email:
+                    cliente.email = row['email']
+                if not cliente.sucursal_id and sucursal_admin_id:
+                    cliente.sucursal_id = sucursal_admin_id
+                db.flush()
+
+            # 3. PÓLIZA (UPSERT)
+            numero_poliza_limpio = str(row['numero_poliza']).strip()
+            fecha_fin = row['fecha_fin_vigencia']
+            if pd.isna(fecha_fin) or not fecha_fin:
+                fecha_fin = datetime.now().date()
+
+            poliza_existente = db.query(Poliza).filter(Poliza.numero_poliza == numero_poliza_limpio).first()
+            if poliza_existente:
+                poliza_existente.fecha_fin_vigencia = fecha_fin
+                poliza_existente.saldo_adeudado = float(row['saldo_adeudado'] or 0)
+                
+                bien = db.query(BienAsegurado).filter(BienAsegurado.poliza_id == poliza_existente.id).first()
+                if bien:
+                    bien.patente = row['patente'] if pd.notna(row['patente']) else bien.patente
+                    bien.descripcion_modelo = row['descripcion_modelo'] if row['descripcion_modelo'] else bien.descripcion_modelo
+            else:
+                nueva_poliza = Poliza(
+                    cliente_id=cliente.id,
+                    compania_id=cia.id,
+                    numero_poliza=numero_poliza_limpio,
+                    fecha_fin_vigencia=fecha_fin,
+                    estado_vigencia="VIGENTE",
+                    saldo_adeudado=float(row['saldo_adeudado'] or 0),
+                    is_enabled=True,
+                    periodo_facturacion="S/D",
+                    forma_pago="S/D"
+                )
+                db.add(nueva_poliza)
+                db.flush()
+
+                nuevo_bien = BienAsegurado(
+                    poliza_id=nueva_poliza.id,
+                    tipo=row['tipo'] or 'Automotor',
+                    descripcion_modelo=row['descripcion_modelo'] or 'Ver Póliza',
+                    patente=row['patente'] if pd.notna(row['patente']) else None,
+                    detalles=row['detalles_bien'] or {}
+                )
+                db.add(nuevo_bien)
+
+            procesados += 1
+            
+        db.commit()
+        return {"status": "success", "procesados": procesados}
+
+    except Exception as e:
+        db.rollback()
+        logger.error(f"🚨 Error en ingesta masiva: {str(e)}")
+        raise HTTPException(status_code=500, detail=str(e))
+    finally:
+        db.close()
+        if temp_file_path and os.path.exists(temp_file_path):
+            try:
+                os.remove(temp_file_path)
+            except Exception:
+                pass
 
 @app.post("/api/save-poliza")
 async def save_poliza(datos: dict, usuario: dict = Depends(obtener_usuario_actual)):
