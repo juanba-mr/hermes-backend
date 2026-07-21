@@ -663,10 +663,22 @@ async def upload_poliza(file: UploadFile = File(...)):
         Eres un asistente experto y analítico en seguros de Argentina.
         Tu tarea es leer la póliza adjunta, deducir la información oculta siguiendo ESTRICTAMENTE las reglas de negocio, y devolver los datos en formato JSON.
         
+        REGLAS DE IDENTIFICACIÓN DE PERSONAS (¡MUY IMPORTANTE!):
+        - El campo "nombre" DEBE ser el del ASEGURADO o TOMADOR (por ejemplo, "BRACAMONTE FACUNDO", "GUYET CRISTINA VIVIANA").
+        - NO confundas al Asegurado con el PRODUCTOR, ASESOR, ORGANIZADOR o MATRÍCULA de seguros (por ejemplo, "MERCADO FRANCISCO ALFREDO" o el código "97792"). El nombre del productor o su matrícula NUNCA debe ser extraído como el nombre o DNI del asegurado.
+        - El campo "dni" DEBE ser el DNI del ASEGURADO, el cual debe extraerse de su CUIT/CUIL de 11 dígitos que figure al lado o debajo de sus datos de asegurado.
+        
         REGLA CRÍTICA PARA EL DNI (¡NO ALUCINAR!):
         - Extrae el número EXACTO que figura en el documento. NO inventes números.
-        - Si el documento muestra un CUIT (ejemplo: 20-35123456-9 o 20351234569), extrae ÚNICAMENTE los 8 dígitos centrales (35123456) y omite el prefijo (20, 23, 27) y el dígito verificador.
+        - REGLA DE EXTRACCIÓN DE DNI DESDE CUIT/CUIL:
+          * Si el CUIT/CUIL tiene guiones (ej. 20-35123456-9), el DNI es exactamente el grupo central de 8 dígitos (35123456).
+          * Si el CUIT/CUIL NO tiene guiones y es un bloque continuo de 11 dígitos (ej. 20351234569):
+            - Los primeros 2 dígitos son el prefijo (ej. 20, 23, 27). ¡ELIMÍNALOS!
+            - El último dígito es el verificador (ej. 9). ¡ELIMÍNALO!
+            - El DNI son los 8 dígitos del medio. Por ejemplo, en "20351234569", eliminas el "20" del principio y el "9" del final, obteniendo "35123456" (8 dígitos).
+            - NUNCA tomes los primeros 8 dígitos del CUIT (como "20351234") como si fueran el DNI. El DNI de un CUIT "20351234569" NUNCA empieza con el prefijo "20", "23" o "27".
         - El campo "dni" DEBE ser estrictamente una cadena de 7 u 8 números. No incluyas puntos ni letras.    
+        - NO utilices la matrícula, código de productor o casillero (como "97792", "1989", etc.) como el DNI del asegurado.
 
         REGLAS DE COMPAÑÍA:
         - Si menciona "Río Uruguay", "RUS" o su CUIT, compania es "RUS".
